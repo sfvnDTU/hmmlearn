@@ -16,7 +16,7 @@ from sklearn import cluster
 from sklearn.mixture import (
     distribute_covar_matrix_to_match_covariance_type, _validate_covars
 )
-from sklearn.utils import check_random_state
+from sklearn.utils import check_array, check_random_state
 
 from .stats import log_multivariate_normal_density
 from .base import _BaseHMM
@@ -159,7 +159,7 @@ class SubspaceGaussianHMM(_BaseHMM):
                      covars_prior=1e-2, covars_weight=1,
                      algorithm="viterbi", random_state=None,
                      n_iter=10, tol=1e-2, verbose=False,
-                     params="stmc", init_params="stmc"):
+                     params="stmcr", init_params="stmcr"):
             _BaseHMM.__init__(self, n_components,
                               startprob_prior=startprob_prior,
                               transmat_prior=transmat_prior, algorithm=algorithm,
@@ -174,6 +174,56 @@ class SubspaceGaussianHMM(_BaseHMM):
             self.covars_prior = covars_prior
             self.covars_weight = covars_weight
             self.forward_model = forward_model
+
+        def fit(self, X, lengths=None):
+            """Estimate model parameters.
+
+            An initialization step is performed before entering the
+            EM algorithm. If you want to avoid this step for a subset of
+            the parameters, pass proper ``init_params`` keyword argument
+            to estimator's constructor.
+
+            Parameters
+            ----------
+            X : array-like, shape (n_samples, n_features)
+                Feature matrix of individual samples.
+
+            lengths : array-like of integers, shape (n_sequences, )
+                Lengths of the individual sequences in ``X``. The sum of
+                these should be ``n_samples``.
+
+            Returns
+            -------
+            self : object
+                Returns self.
+            """
+            X = check_array(X)
+            self._init(X, lengths=lengths)
+            self._check()
+
+            self.monitor_ = _BaseHMM.ConvergenceMonitor(self.tol, self.n_iter, self.verbose)
+            for iter in range(self.n_iter):
+                stats = self._initialize_sufficient_statistics()
+                curr_logprob = 0
+                for i, j in iter_from_X_lengths(X, lengths):
+                    framelogprob = self._compute_log_likelihood(self.subspace_repr_[i:j])
+                    logprob, fwdlattice = self._do_forward_pass(framelogprob)
+                    curr_logprob += logprob
+                    bwdlattice = self._do_backward_pass(framelogprob)
+                    posteriors = self._compute_posteriors(fwdlattice, bwdlattice)
+                    self._accumulate_sufficient_statistics(
+                        stats, self.subspace_repr_[i:j], framelogprob, posteriors, fwdlattice,
+                        bwdlattice)
+
+                # XXX must be before convergence check, because otherwise
+                #     there won't be any updates for the case ``n_iter=1``.
+                self._do_mstep(stats)
+
+                self.monitor_.report(curr_logprob)
+                if self.monitor_.converged:
+                    break
+
+            return self
 
         @property
         def covars_(self):
@@ -217,32 +267,34 @@ class SubspaceGaussianHMM(_BaseHMM):
                 raise ValueError('Unexpected number of dimensions, got %s but '
                                  'expected %s' % (n_subspace, self.n_subspace))
 
-
             self.n_subspace = n_subspace
             self.n_observationspace = n_observationspaceX
+
+            if 'r' in self.init_params or not hasattr(self,"subspace_repr_"):
+                # TODO: Code currently assmues orthonormal forward model
+                self.subspace_repr_ = np.dot(X,self.forward_model.T)
 
             if 'm' in self.init_params or not hasattr(self, "means_"):
                 kmeans = cluster.KMeans(n_clusters=self.n_components,
                                         random_state=self.random_state)
-                # TODO: Code currently assmues orthonormal forward model
-                kmeans.fit(np.dot(X,self.forward_model.T))
+                kmeans.fit(self.subspace_repr_)
                 self.means_ = kmeans.cluster_centers_
             if 'c' in self.init_params or not hasattr(self, "covars_"):
-                cv = np.cov(np.dot(X,self.forward_model.T).T) + \
-                     self.min_covar * np.eye(X.shape[1])
+                cv = np.cov(self.subspace_repr_.T) \
+                     + self.min_covar * np.eye(X.shape[1])
                 if not cv.shape:
                     cv.shape = (1, 1)
                 self._covars_ = distribute_covar_matrix_to_match_covariance_type(
                     cv, self.covariance_type, self.n_components).copy()
 
-        def _compute_log_likelihood(self, X):
+        def _compute_log_likelihood(self, Ysub):
             return log_multivariate_normal_density(
-                X, self.means_, self._covars_, self.covariance_type)
+                Ysub, self.means_, self._covars_, self.covariance_type)
 
         def _generate_sample_from_state(self, state, random_state=None):
-            return random_state.multivariate_normal(
-                self.means_[state], self.covars_[state]
-            )
+            # TODO: Sample with noise in observation space (add white noise)
+            return np.dot(random_state.multivariate_normal(
+                self.means_[state], self.covars_[state], self.forward_model))
 
         def _initialize_sufficient_statistics(self):
             stats = super(GaussianHMM, self)._initialize_sufficient_statistics()
