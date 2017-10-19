@@ -19,7 +19,7 @@ from sklearn.mixture import (
 from sklearn.utils import check_array, check_random_state
 
 from .stats import log_multivariate_normal_density
-from .base import _BaseHMM
+from .base import _BaseHMM, ConvergenceMonitor
 from .utils import iter_from_X_lengths, normalize, fill_covars
 
 __all__ = ["GMMHMM", "GaussianHMM", "MultinomialHMM", "SubspaceGaussianHMM"]
@@ -28,353 +28,382 @@ COVARIANCE_TYPES = frozenset(("spherical", "diag", "full", "tied"))
 
 
 class SubspaceGaussianHMM(_BaseHMM):
-        """Hidden Markov Model with Gaussian emissions in a subspace defined by a forward model.
+    """Hidden Markov Model with Gaussian emissions in a subspace defined by a forward model.
+
+    Parameters
+    ----------
+    n_components : int
+        Number of states.
+
+    forward_model: array, shape (n_subspace, n_observationspace)
+        Matrix defining the linear mapping from subspace
+        to observationspace (e.g. from a PCA) :attr:`forward_model_`.
+
+    covariance_type : string, optional
+        String describing the type of covariance parameters to
+        use.  Must be one of
+
+        * "spherical" --- each state uses a single variance value that
+          applies to all features.
+        * "diag" --- each state uses a diagonal covariance matrix.
+        * "full" --- each state uses a full (i.e. unrestricted)
+          covariance matrix.
+        * "tied" --- all states use **the same** full covariance matrix.
+
+        Defaults to "diag".
+
+
+    min_covar : float, optional
+        Floor on the diagonal of the covariance matrix to prevent
+        overfitting. Defaults to 1e-3.
+
+    startprob_prior : array, shape (n_components, ), optional
+        Parameters of the Dirichlet prior distribution for
+        :attr:`startprob_`.
+
+    transmat_prior : array, shape (n_components, n_components), optional
+        Parameters of the Dirichlet prior distribution for each row
+        of the transition probabilities :attr:`transmat_`.
+
+    means_prior, means_weight : array, shape (n_components, ), optional
+        Mean and precision of the Normal prior distribtion for
+        :attr:`means_`.
+
+    covars_prior, covars_weight : array, shape (n_components, ), optional
+        Parameters of the prior distribution for the covariance matrix
+        :attr:`covars_`.
+
+        If :attr:`covariance_type` is "spherical" or "diag" the prior is
+        the inverse gamma distribution, otherwise --- the inverse Wishart
+        distribution.
+
+    algorithm : string, optional
+        Decoder algorithm. Must be one of "viterbi" or`"map".
+        Defaults to "viterbi".
+
+    random_state: RandomState or an int seed, optional
+        A random number generator instance.
+
+    n_iter : int, optional
+        Maximum number of iterations to perform.
+
+    tol : float, optional
+        Convergence threshold. EM will stop if the gain in log-likelihood
+        is below this value.
+
+    verbose : bool, optional
+        When ``True`` per-iteration convergence reports are printed
+        to :data:`sys.stderr`. You can diagnose convergence via the
+        :attr:`monitor_` attribute.
+
+    params : string, optional
+        Controls which parameters are updated in the training
+        process.  Can contain any combination of 's' for startprob,
+        't' for transmat, 'm' for means and 'c' for covars. Defaults
+        to all parameters.
+
+    init_params : string, optional
+        Controls which parameters are initialized prior to
+        training.  Can contain any combination of 's' for
+        startprob, 't' for transmat, 'm' for means and 'c' for covars.
+        Defaults to all parameters.
+
+    Attributes
+    ----------
+    n_subspace : int
+        Dimensionality of subspace. (inherited from forward_model)
+
+    n_observationspace : int
+        Dimensionality of the data space.
+
+    monitor\_ : ConvergenceMonitor
+        Monitor object used to check the convergence of EM.
+
+    transmat\_ : array, shape (n_components, n_components)
+        Matrix of transition probabilities between states.
+
+    startprob\_ : array, shape (n_components, )
+        Initial state occupation distribution.
+
+    forward_model\_ : array, shape(n_subspace, n_observationspace)
+        Matrix that maps subspace onto observationspace
+
+    subspace_repr\_ : array,
+
+    means\_ : array, shape (n_components, n_features)
+        Mean parameters for each state.
+
+    covars\_ : array
+        Covariance parameters for each state.
+
+        The shape depends on :attr:`covariance_type`::
+
+            (n_components, )                        if "spherical",
+            (n_subspace, n_subspace)                if "tied",
+            (n_components, n_subspace)              if "diag",
+            (n_components, n_subspace, n_subspace)  if "full"
+
+    Examples
+    --------
+    >>> from hmmlearn.hmm import SubspaceGaussianHMM
+    >>> SubspaceGaussianHMM(n_components=2, forward_model=None)
+    ...                             #doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
+    SubspaceGaussianHMM(algorithm='viterbi',...
+    """
+
+    def __init__(self, n_components=1, forward_model=None,
+                 covariance_type='diag',
+                 min_covar=1e-3,
+                 startprob_prior=1.0, transmat_prior=1.0,
+                 means_prior=0, means_weight=0,
+                 covars_prior=1e-2, covars_weight=1,
+                 algorithm="viterbi", random_state=None,
+                 n_iter=10, tol=1e-2, verbose=False,
+                 params="stmcrn", init_params="stmcrn"):
+        _BaseHMM.__init__(self, n_components,
+                          startprob_prior=startprob_prior,
+                          transmat_prior=transmat_prior, algorithm=algorithm,
+                          random_state=random_state, n_iter=n_iter,
+                          tol=tol, params=params, verbose=verbose,
+                          init_params=init_params)
+
+        self.covariance_type = covariance_type
+        self.min_covar = min_covar
+        self.means_prior = means_prior
+        self.means_weight = means_weight
+        self.covars_prior = covars_prior
+        self.covars_weight = covars_weight
+        self.forward_model = forward_model
+
+    def fit(self, X, lengths=None):
+        """Estimate model parameters.
+
+        An initialization step is performed before entering the
+        EM algorithm. If you want to avoid this step for a subset of
+        the parameters, pass proper ``init_params`` keyword argument
+        to estimator's constructor.
 
         Parameters
         ----------
-        n_components : int
-            Number of states.
+        X : array-like, shape (n_samples, n_features)
+            Feature matrix of individual samples.
 
-        forward_model: array, shape (n_subspace, n_observationspace)
-            Matrix defining the linear mapping from subspace
-            to observationspace (e.g. from a PCA) :attr:`forward_model_`.
+        lengths : array-like of integers, shape (n_sequences, )
+            Lengths of the individual sequences in ``X``. The sum of
+            these should be ``n_samples``.
 
-        covariance_type : string, optional
-            String describing the type of covariance parameters to
-            use.  Must be one of
-
-            * "spherical" --- each state uses a single variance value that
-              applies to all features.
-            * "diag" --- each state uses a diagonal covariance matrix.
-            * "full" --- each state uses a full (i.e. unrestricted)
-              covariance matrix.
-            * "tied" --- all states use **the same** full covariance matrix.
-
-            Defaults to "diag".
-
-
-        min_covar : float, optional
-            Floor on the diagonal of the covariance matrix to prevent
-            overfitting. Defaults to 1e-3.
-
-        startprob_prior : array, shape (n_components, ), optional
-            Parameters of the Dirichlet prior distribution for
-            :attr:`startprob_`.
-
-        transmat_prior : array, shape (n_components, n_components), optional
-            Parameters of the Dirichlet prior distribution for each row
-            of the transition probabilities :attr:`transmat_`.
-
-        means_prior, means_weight : array, shape (n_components, ), optional
-            Mean and precision of the Normal prior distribtion for
-            :attr:`means_`.
-
-        covars_prior, covars_weight : array, shape (n_components, ), optional
-            Parameters of the prior distribution for the covariance matrix
-            :attr:`covars_`.
-
-            If :attr:`covariance_type` is "spherical" or "diag" the prior is
-            the inverse gamma distribution, otherwise --- the inverse Wishart
-            distribution.
-
-        algorithm : string, optional
-            Decoder algorithm. Must be one of "viterbi" or`"map".
-            Defaults to "viterbi".
-
-        random_state: RandomState or an int seed, optional
-            A random number generator instance.
-
-        n_iter : int, optional
-            Maximum number of iterations to perform.
-
-        tol : float, optional
-            Convergence threshold. EM will stop if the gain in log-likelihood
-            is below this value.
-
-        verbose : bool, optional
-            When ``True`` per-iteration convergence reports are printed
-            to :data:`sys.stderr`. You can diagnose convergence via the
-            :attr:`monitor_` attribute.
-
-        params : string, optional
-            Controls which parameters are updated in the training
-            process.  Can contain any combination of 's' for startprob,
-            't' for transmat, 'm' for means and 'c' for covars. Defaults
-            to all parameters.
-
-        init_params : string, optional
-            Controls which parameters are initialized prior to
-            training.  Can contain any combination of 's' for
-            startprob, 't' for transmat, 'm' for means and 'c' for covars.
-            Defaults to all parameters.
-
-        Attributes
-        ----------
-        n_subspace : int
-            Dimensionality of subspace. (inherited from forward_model)
-
-        n_observationspace : int
-            Dimensionality of the data space.
-
-        monitor\_ : ConvergenceMonitor
-            Monitor object used to check the convergence of EM.
-
-        transmat\_ : array, shape (n_components, n_components)
-            Matrix of transition probabilities between states.
-
-        startprob\_ : array, shape (n_components, )
-            Initial state occupation distribution.
-
-        forward_model\_ : array, shape(n_subspace, n_observationspace)
-            Matrix that maps subspace onto observationspace
-
-        subspace_repr\_ : array,
-
-        means\_ : array, shape (n_components, n_features)
-            Mean parameters for each state.
-
-        covars\_ : array
-            Covariance parameters for each state.
-
-            The shape depends on :attr:`covariance_type`::
-
-                (n_components, )                        if "spherical",
-                (n_subspace, n_subspace)                if "tied",
-                (n_components, n_subspace)              if "diag",
-                (n_components, n_subspace, n_subspace)  if "full"
-
-        Examples
-        --------
-        >>> from hmmlearn.hmm import SubspaceGaussianHMM
-        >>> SubspaceGaussianHMM(n_components=2, forward_model=A)
-        ...                             #doctest: +ELLIPSIS +NORMALIZE_WHITESPACE
-        GaussianHMM(algorithm='viterbi',...
+        Returns
+        -------
+        self : object
+            Returns self.
         """
+        X = check_array(X)
+        self._init(X, lengths=lengths)
+        self._check()
 
-        def __init__(self, n_components=1, forward_model=None,
-                     covariance_type='diag',
-                     min_covar=1e-3,
-                     startprob_prior=1.0, transmat_prior=1.0,
-                     means_prior=0, means_weight=0,
-                     covars_prior=1e-2, covars_weight=1,
-                     algorithm="viterbi", random_state=None,
-                     n_iter=10, tol=1e-2, verbose=False,
-                     params="stmcr", init_params="stmcr"):
-            _BaseHMM.__init__(self, n_components,
-                              startprob_prior=startprob_prior,
-                              transmat_prior=transmat_prior, algorithm=algorithm,
-                              random_state=random_state, n_iter=n_iter,
-                              tol=tol, params=params, verbose=verbose,
-                              init_params=init_params)
+        self.monitor_ = ConvergenceMonitor(self.tol, self.n_iter, self.verbose)
+        for iter in range(self.n_iter):
+            stats = self._initialize_sufficient_statistics()
+            curr_logprob = 0
+            for i, j in iter_from_X_lengths(X, lengths):
+                framelogprob = self._compute_log_likelihood(self.subspace_repr_[i:j])
+                logprob, fwdlattice = self._do_forward_pass(framelogprob)
+                curr_logprob += logprob
+                bwdlattice = self._do_backward_pass(framelogprob)
+                posteriors = self._compute_posteriors(fwdlattice, bwdlattice)
+                self._accumulate_sufficient_statistics(
+                    stats, self.subspace_repr_[i:j], framelogprob, posteriors, fwdlattice,
+                    bwdlattice)
 
-            self.covariance_type = covariance_type
-            self.min_covar = min_covar
-            self.means_prior = means_prior
-            self.means_weight = means_weight
-            self.covars_prior = covars_prior
-            self.covars_weight = covars_weight
-            self.forward_model = forward_model
+            # XXX must be before convergence check, because otherwise
+            #     there won't be any updates for the case ``n_iter=1``.
+            self._do_mstep(stats)
 
-        def fit(self, X, lengths=None):
-            """Estimate model parameters.
+            self.monitor_.report(curr_logprob)
+            if self.monitor_.converged:
+                break
 
-            An initialization step is performed before entering the
-            EM algorithm. If you want to avoid this step for a subset of
-            the parameters, pass proper ``init_params`` keyword argument
-            to estimator's constructor.
+        return self
 
-            Parameters
-            ----------
-            X : array-like, shape (n_samples, n_features)
-                Feature matrix of individual samples.
+    @property
+    def covars_(self):
+        """Return covars as a full matrix."""
+        return fill_covars(self._covars_, self.covariance_type,
+                           self.n_components, self.n_subspace)
 
-            lengths : array-like of integers, shape (n_sequences, )
-                Lengths of the individual sequences in ``X``. The sum of
-                these should be ``n_samples``.
+    @covars_.setter
+    def covars_(self, covars):
+        self._covars_ = np.asarray(covars).copy()
 
-            Returns
-            -------
-            self : object
-                Returns self.
-            """
-            X = check_array(X)
-            self._init(X, lengths=lengths)
-            self._check()
+    def _check(self):
+        super(SubspaceGaussianHMM, self)._check()
 
-            self.monitor_ = _BaseHMM.ConvergenceMonitor(self.tol, self.n_iter, self.verbose)
-            for iter in range(self.n_iter):
-                stats = self._initialize_sufficient_statistics()
-                curr_logprob = 0
-                for i, j in iter_from_X_lengths(X, lengths):
-                    framelogprob = self._compute_log_likelihood(self.subspace_repr_[i:j])
-                    logprob, fwdlattice = self._do_forward_pass(framelogprob)
-                    curr_logprob += logprob
-                    bwdlattice = self._do_backward_pass(framelogprob)
-                    posteriors = self._compute_posteriors(fwdlattice, bwdlattice)
-                    self._accumulate_sufficient_statistics(
-                        stats, self.subspace_repr_[i:j], framelogprob, posteriors, fwdlattice,
-                        bwdlattice)
+        self.means_ = np.asarray(self.means_)
+        self.n_subspace = self.means_.shape[1]
 
-                # XXX must be before convergence check, because otherwise
-                #     there won't be any updates for the case ``n_iter=1``.
-                self._do_mstep(stats)
+        if self.covariance_type not in COVARIANCE_TYPES:
+            raise ValueError('covariance_type must be one of {0}'
+                             .format(COVARIANCE_TYPES))
 
-                self.monitor_.report(curr_logprob)
-                if self.monitor_.converged:
-                    break
-
-            return self
-
-        @property
-        def covars_(self):
-            """Return covars as a full matrix."""
-            return fill_covars(self._covars_, self.covariance_type,
-                               self.n_components, self.n_subspace)
-
-        @covars_.setter
-        def covars_(self, covars):
-            self._covars_ = np.asarray(covars).copy()
-
-        def _check(self):
-            super(SubspaceGaussianHMM, self)._check()
-
-            self.means_ = np.asarray(self.means_)
-            self.n_subspace = self.means_.shape[1]
-
-            if self.covariance_type not in COVARIANCE_TYPES:
-                raise ValueError('covariance_type must be one of {0}'
-                                 .format(COVARIANCE_TYPES))
-
-            _validate_covars(self._covars_, self.covariance_type,
-                             self.n_components)
-            if not self.forward_model:
-                raise ValueError('Argument forward_model was not specified'
-                                 '- please use GaussianHMM instead')
+        _validate_covars(self._covars_, self.covariance_type,
+                         self.n_components)
+        if self.forward_model is None:
+            raise ValueError('Argument forward_model was not specified'
+                             '- please use GaussianHMM instead')
 
 
-        def _init(self, X, lengths=None):
-            super(SubspaceGaussianHMM, self)._init(X, lengths=lengths)
+    def _init(self, X, lengths=None):
+        super(SubspaceGaussianHMM, self)._init(X, lengths=lengths)
 
-            _, n_observationspaceX = X.shape
-            n_subspace, n_observationspaceA = self.forward_model.shape
+        _, n_observationspaceX = X.shape
+        n_subspace, n_observationspaceA = self.forward_model.shape
 
-            if n_observationspaceA != n_observationspaceX:
-                raise ValueError('forward_model and data do not match in dimensions.'
-                                 'forward_model shape : %s , data shape: %s'
-                                 %(self.forward_model.shape, X.shape))
+        if n_observationspaceA != n_observationspaceX:
+            raise ValueError('forward_model and data do not match in dimensions.'
+                             'forward_model shape : %s , data shape: %s'
+                             %(self.forward_model.shape, X.shape))
 
-            if hasattr(self, 'n_subspace') and self.n_subspace != n_subspace:
-                raise ValueError('Unexpected number of dimensions, got %s but '
-                                 'expected %s' % (n_subspace, self.n_subspace))
+        if hasattr(self, 'n_subspace') and self.n_subspace != n_subspace:
+            raise ValueError('Unexpected number of dimensions, got %s but '
+                             'expected %s' % (n_subspace, self.n_subspace))
 
-            self.n_subspace = n_subspace
-            self.n_observationspace = n_observationspaceX
+        self.n_subspace = n_subspace
+        self.n_observationspace = n_observationspaceX
 
-            if 'r' in self.init_params or not hasattr(self,"subspace_repr_"):
-                # TODO: Code currently assmues orthonormal forward model
-                self.subspace_repr_ = np.dot(X,self.forward_model.T)
+        if 'r' in self.init_params or not hasattr(self, "subspace_repr_"):
+            # TODO: Code currently assmues orthonormal forward model
+            self.subspace_repr_ = np.dot(X,self.forward_model.T)
+            # TODO: A*X is saved in object (backward_repr_)
+            self.backward_repr_ = np.dot(X,self.forward_model.T)
 
-            if 'm' in self.init_params or not hasattr(self, "means_"):
-                kmeans = cluster.KMeans(n_clusters=self.n_components,
-                                        random_state=self.random_state)
-                kmeans.fit(self.subspace_repr_)
-                self.means_ = kmeans.cluster_centers_
-            if 'c' in self.init_params or not hasattr(self, "covars_"):
-                cv = np.cov(self.subspace_repr_.T) \
-                     + self.min_covar * np.eye(X.shape[1])
-                if not cv.shape:
-                    cv.shape = (1, 1)
-                self._covars_ = distribute_covar_matrix_to_match_covariance_type(
-                    cv, self.covariance_type, self.n_components).copy()
+        if 'm' in self.init_params or not hasattr(self, "means_"):
+            kmeans = cluster.KMeans(n_clusters=self.n_components,
+                                    random_state=self.random_state)
+            kmeans.fit(self.subspace_repr_)
+            self.means_ = kmeans.cluster_centers_
+        if 'c' in self.init_params or not hasattr(self, "covars_"):
+            cv = np.cov(self.subspace_repr_.T) \
+                 + self.min_covar * np.eye(self.n_subspace)
+            if not cv.shape:
+                cv.shape = (1, 1)
+            self._covars_ = distribute_covar_matrix_to_match_covariance_type(
+                cv, self.covariance_type, self.n_components).copy()
 
-        def _compute_log_likelihood(self, Ysub):
-            return log_multivariate_normal_density(
-                Ysub, self.means_, self._covars_, self.covariance_type)
+        if 'n' in self.init_params or not hasattr(self, "noise_"):
+            # TODO: Noise in observation space initialized to 1
+            self.noise_ = 1.0
 
-        def _generate_sample_from_state(self, state, random_state=None):
-            # TODO: Sample with noise in observation space (add white noise)
-            return np.dot(random_state.multivariate_normal(
-                self.means_[state], self.covars_[state], self.forward_model))
+    def _compute_log_likelihood(self, Ysub):
+        return log_multivariate_normal_density(
+            Ysub, self.means_, self._covars_, self.covariance_type)
 
-        def _initialize_sufficient_statistics(self):
-            stats = super(GaussianHMM, self)._initialize_sufficient_statistics()
-            stats['post'] = np.zeros(self.n_components)
-            stats['obs'] = np.zeros((self.n_components, self.n_subspace))
-            stats['obs**2'] = np.zeros((self.n_components, self.n_subspace))
-            if self.covariance_type in ('tied', 'full'):
-                stats['obs*obs.T'] = np.zeros((self.n_components, self.n_subspace,
-                                               self.n_subspace))
-            return stats
+    def _generate_sample_from_state(self, state, random_state=None):
+        # TODO: Sample with noise in observation space (add white noise)
+        return np.dot(random_state.multivariate_normal(
+            self.means_[state], self.covars_[state], self.forward_model))
 
-        def _accumulate_sufficient_statistics(self, stats, obs, framelogprob,
-                                              posteriors, fwdlattice, bwdlattice):
-            super(GaussianHMM, self)._accumulate_sufficient_statistics(
-                stats, obs, framelogprob, posteriors, fwdlattice, bwdlattice)
+    def _initialize_sufficient_statistics(self):
+        stats = super(SubspaceGaussianHMM, self)._initialize_sufficient_statistics()
+        stats['post'] = np.zeros(self.n_components)
+        stats['obs'] = np.zeros((self.n_components, self.n_subspace))
+        stats['obs**2'] = np.zeros((self.n_components, self.n_subspace))
+        stats['full_post'] = np.array([]).reshape(0,self.n_components)
+        if self.covariance_type in ('tied', 'full'):
+            stats['obs*obs.T'] = np.zeros((self.n_components, self.n_subspace,
+                                           self.n_subspace))
+        return stats
 
-            if 'm' in self.params or 'c' in self.params:
-                stats['post'] += posteriors.sum(axis=0)
-                stats['obs'] += np.dot(posteriors.T, obs)
+    def _accumulate_sufficient_statistics(self, stats, obs, framelogprob,
+                                          posteriors, fwdlattice, bwdlattice):
+        super(SubspaceGaussianHMM, self)._accumulate_sufficient_statistics(
+            stats, obs, framelogprob, posteriors, fwdlattice, bwdlattice)
 
-            if 'c' in self.params:
-                if self.covariance_type in ('spherical', 'diag'):
-                    stats['obs**2'] += np.dot(posteriors.T, obs ** 2)
-                elif self.covariance_type in ('tied', 'full'):
-                    # posteriors: (nt, nc); obs: (nt, nf); obs: (nt, nf)
-                    # -> (nc, nf, nf)
-                    stats['obs*obs.T'] += np.einsum(
-                        'ij,ik,il->jkl', posteriors, obs, obs)
+        if 'm' in self.params or 'c' in self.params:
+            stats['post'] += posteriors.sum(axis=0)
+            stats['obs'] += np.dot(posteriors.T, obs)
 
-        def _do_mstep(self, stats):
-            super(GaussianHMM, self)._do_mstep(stats)
+        if 'c' in self.params:
+            if self.covariance_type in ('spherical', 'diag'):
+                stats['obs**2'] += np.dot(posteriors.T, obs ** 2)
+            elif self.covariance_type in ('tied', 'full'):
+                # posteriors: (nt, nc); obs: (nt, nf); obs: (nt, nf)
+                # -> (nc, nf, nf)
+                stats['obs*obs.T'] += np.einsum(
+                    'ij,ik,il->jkl', posteriors, obs, obs)
 
-            means_prior = self.means_prior
-            means_weight = self.means_weight
+        if 'r' in self.params:
+            # TODO: Stupid variable choice - should be a numpy array (not array of numpy arrays)
+            stats['full_post']=np.vstack([stats['full_post'], posteriors])
 
-            # TODO: find a proper reference for estimates for different
-            #       covariance models.
-            # Based on Huang, Acero, Hon, "Spoken Language Processing",
-            # p. 443 - 445
-            denom = stats['post'][:, np.newaxis]
-            if 'm' in self.params:
-                self.means_ = ((means_weight * means_prior + stats['obs'])
-                               / (means_weight + denom))
 
-            if 'c' in self.params:
-                covars_prior = self.covars_prior
-                covars_weight = self.covars_weight
-                meandiff = self.means_ - means_prior
+    def _do_mstep(self, stats):
+        super(SubspaceGaussianHMM, self)._do_mstep(stats)
 
-                if self.covariance_type in ('spherical', 'diag'):
-                    cv_num = (means_weight * meandiff ** 2
-                              + stats['obs**2']
-                              - 2 * self.means_ * stats['obs']
-                              + self.means_ ** 2 * denom)
-                    cv_den = max(covars_weight - 1, 0) + denom
-                    self._covars_ = \
-                        (covars_prior + cv_num) / np.maximum(cv_den, 1e-5)
-                    if self.covariance_type == 'spherical':
-                        self._covars_ = np.tile(
-                            self._covars_.mean(1)[:, np.newaxis],
-                            (1, self._covars_.shape[1]))
-                elif self.covariance_type in ('tied', 'full'):
-                    cv_num = np.empty((self.n_components, self.n_subspace,
-                                       self.n_subspace))
-                    for c in range(self.n_components):
-                        obsmean = np.outer(stats['obs'][c], self.means_[c])
+        means_prior = self.means_prior
+        means_weight = self.means_weight
 
-                        cv_num[c] = (means_weight * np.outer(meandiff[c],
-                                                             meandiff[c])
-                                     + stats['obs*obs.T'][c]
-                                     - obsmean - obsmean.T
-                                     + np.outer(self.means_[c], self.means_[c])
-                                     * stats['post'][c])
-                    cvweight = max(covars_weight - self.n_subspace, 0)
-                    if self.covariance_type == 'tied':
-                        self._covars_ = ((covars_prior + cv_num.sum(axis=0)) /
-                                         (cvweight + stats['post'].sum()))
-                    elif self.covariance_type == 'full':
-                        self._covars_ = ((covars_prior + cv_num) /
-                                         (cvweight + stats['post'][:, None, None]))
+        # TODO: find a proper reference for estimates for different
+        #       covariance models.
+        # Based on Huang, Acero, Hon, "Spoken Language Processing",
+        # p. 443 - 445
+        denom = stats['post'][:, np.newaxis]
+        if 'm' in self.params:
+            self.means_ = ((means_weight * means_prior + stats['obs'])
+                           / (means_weight + denom))
+
+        if 'c' in self.params:
+            covars_prior = self.covars_prior
+            covars_weight = self.covars_weight
+            meandiff = self.means_ - means_prior
+
+            if self.covariance_type in ('spherical', 'diag'):
+                cv_num = (means_weight * meandiff ** 2
+                          + stats['obs**2']
+                          - 2 * self.means_ * stats['obs']
+                          + self.means_ ** 2 * denom)
+                cv_den = max(covars_weight - 1, 0) + denom
+                self._covars_ = \
+                    (covars_prior + cv_num) / np.maximum(cv_den, 1e-5)
+                if self.covariance_type == 'spherical':
+                    self._covars_ = np.tile(
+                        self._covars_.mean(1)[:, np.newaxis],
+                        (1, self._covars_.shape[1]))
+            elif self.covariance_type in ('tied', 'full'):
+                cv_num = np.empty((self.n_components, self.n_subspace,
+                                   self.n_subspace))
+                for c in range(self.n_components):
+                    obsmean = np.outer(stats['obs'][c], self.means_[c])
+
+                    cv_num[c] = (means_weight * np.outer(meandiff[c],
+                                                         meandiff[c])
+                                 + stats['obs*obs.T'][c]
+                                 - obsmean - obsmean.T
+                                 + np.outer(self.means_[c], self.means_[c])
+                                 * stats['post'][c])
+                cvweight = max(covars_weight - self.n_subspace, 0)
+                if self.covariance_type == 'tied':
+                    self._covars_ = ((covars_prior + cv_num.sum(axis=0)) /
+                                     (cvweight + stats['post'].sum()))
+                elif self.covariance_type == 'full':
+                    self._covars_ = ((covars_prior + cv_num) /
+                                     (cvweight + stats['post'][:, None, None]))
+
+        if 'r' in self.params:
+            stats['full_post'] = np.array(stats['full_post']) # TODO: STUPID NAIVE STUFF!?!?!?
+            # TODO: Vectorize subspace_repr_ m-step. Current naive for loop
+            # TODO: Current implementation asssumes full covariance matrix
+            for t in range(stats['full_post'].shape[0]):
+                # Solve (AA^T sum_k z_tk Sigma_k) y_t = A x_t + sum_k z_tk Sigma_k mu_k.T
+                self.subspace_repr_[t] = np.linalg.solve(
+                    np.dot(self.forward_model, self.forward_model.T) +
+                    np.tensordot(stats['full_post'][t], self.covars_, axes=(0,0)),
+                    self.backward_repr_[t,:] + np.tensordot(self.covars_, self.means_, axes=([])) #### HMMM THIS NEEDS MORE THOUGHT!!!
+                    #+ np.tensordot(stats['full_post'][t],
+                    #       np.tensordot(self.covars_, self.means_, axes=(2,1)), axes=(0,0)))
+
+        if 'n' in self.params:
+            # TODO: Update noise in M-step
+            self.noise_ = 1.0
 
 
 class GaussianHMM(_BaseHMM):
